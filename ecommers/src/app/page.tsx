@@ -8,6 +8,9 @@ export default function Home() {
 	const videoRef = useRef<HTMLVideoElement | null>(null);
 	const [status, setStatus] = useState<string>("");
 	const [streamActive, setStreamActive] = useState(false);
+	const [devices, setDevices] = useState<MediaDeviceInfo[]>([]);
+	const [selectedDeviceId, setSelectedDeviceId] = useState<string | null>(null);
+	const [loadingDevices, setLoadingDevices] = useState(false);
 
 	// Helpers para conversiones ArrayBuffer <-> base64
 	function bufferToBase64(buf: ArrayBuffer) {
@@ -26,15 +29,122 @@ export default function Home() {
 	}
 
 	// Cámara
-	async function startCamera() {
+	// Nota: se usan funciones más específicas: startFrontCamera, startRearCamera, startCameraWithDevice
+
+	async function startCameraWithDevice(deviceId: string) {
 		try {
-			const stream = await navigator.mediaDevices.getUserMedia({ video: true });
+			const stream = await navigator.mediaDevices.getUserMedia({
+				video: { deviceId: { exact: deviceId } },
+			});
 			if (videoRef.current) videoRef.current.srcObject = stream;
 			setStreamActive(true);
-			setStatus("Cámara activa");
+			setSelectedDeviceId(deviceId);
+			setStatus("Cámara activa (seleccionada)");
+			await refreshDevices();
 		} catch (err) {
 			console.error(err);
-			setStatus("Error accediendo a la cámara: " + String(err));
+			setStatus("Error accediendo a la cámara seleccionada: " + String(err));
+		}
+	}
+
+	async function startFrontCamera() {
+		try {
+			const stream = await navigator.mediaDevices.getUserMedia({
+				video: { facingMode: "user" },
+			});
+			if (videoRef.current) videoRef.current.srcObject = stream;
+			setStreamActive(true);
+			setStatus("Cámara frontal activa");
+			await refreshDevices();
+		} catch (err) {
+			console.error(err);
+			setStatus("Error accediendo a la cámara frontal: " + String(err));
+		}
+	}
+
+	async function startRearCamera() {
+		setStatus("Buscando mejor cámara trasera...");
+		const best = await pickBestRearDeviceId();
+		if (best) {
+			await startCameraWithDevice(best);
+		} else {
+			// fallback a facingMode
+			await startCameraWithDeviceFallback();
+		}
+	}
+
+	async function startCameraWithDeviceFallback() {
+		try {
+			const stream = await navigator.mediaDevices.getUserMedia({
+				video: { facingMode: { ideal: "environment" } },
+			});
+			if (videoRef.current) videoRef.current.srcObject = stream;
+			setStreamActive(true);
+			setStatus("Cámara trasera (fallback) activa");
+			await refreshDevices();
+		} catch (err) {
+			console.error(err);
+			setStatus("Error accediendo a la cámara trasera (fallback): " + String(err));
+		}
+	}
+
+	async function refreshDevices() {
+		setLoadingDevices(true);
+		try {
+			// Para obtener labels, pedimos permiso si no se ha dado
+			try {
+				await navigator.mediaDevices.getUserMedia({ video: true });
+			} catch {
+				// ignore: permiso no concedido o no disponible
+			}
+			const list = await navigator.mediaDevices.enumerateDevices();
+			const cams = list.filter((d) => d.kind === "videoinput");
+			setDevices(cams);
+			if (!selectedDeviceId && cams.length) setSelectedDeviceId(cams[0].deviceId || null);
+		} catch (err) {
+			console.error(err);
+			setStatus("Error listando dispositivos: " + String(err));
+		} finally {
+			setLoadingDevices(false);
+		}
+	}
+
+	async function pickBestRearDeviceId(): Promise<string | null> {
+		try {
+			const list = await navigator.mediaDevices.enumerateDevices();
+			const cams = list.filter((d) => d.kind === "videoinput");
+			if (!cams.length) return null;
+			// Preferencia por etiqueta si está disponible
+			const labelRear = cams.find((c) => /back|rear|trase|environment|trasera/i.test(c.label));
+			if (labelRear && labelRear.deviceId) return labelRear.deviceId;
+
+			// Si no hay label clara, medimos resolución probando cada dispositivo
+			let bestId: string | null = null;
+			let bestPixels = 0;
+			for (const cam of cams) {
+				try {
+					const s = await navigator.mediaDevices.getUserMedia({
+						video: { deviceId: { exact: cam.deviceId } },
+					});
+					const track = s.getVideoTracks()[0];
+					const settings = track.getSettings();
+					const w = (settings.width as number) || 0;
+					const h = (settings.height as number) || 0;
+					const pixels = w * h;
+					track.stop();
+					if (pixels > bestPixels) {
+						bestPixels = pixels;
+						bestId = cam.deviceId;
+					}
+				} catch (e) {
+					// ignore devices que fallen
+					console.debug("no se pudo abrir dispositivo", cam.deviceId, e);
+				}
+			}
+			return bestId;
+		} catch (err) {
+			console.error(err);
+			return null;
 		}
 	}
 	function stopCamera() {
@@ -145,19 +255,39 @@ export default function Home() {
 
 				<section className="mb-6">
 					<h2 className="font-medium mb-2">Cámara</h2>
-					<div className="flex gap-2 mb-2">
-						<button
-							className="btn"
-							onClick={startCamera}
-							disabled={streamActive}
+					<div className="flex items-center gap-2 mb-2">
+						<select
+							value={selectedDeviceId ?? ""}
+							onChange={(e) => setSelectedDeviceId(e.target.value || null)}
+							className="border px-2 py-1 rounded"
 						>
-							Probar cámara
+							{devices.length === 0 && <option value="">(sin cámaras detectadas)</option>}
+							{devices.map((d) => (
+								<option key={d.deviceId} value={d.deviceId}>
+									{d.label || `Cámara ${d.deviceId}`}
+								</option>
+							))}
+						</select>
+						<button className="btn" onClick={() => refreshDevices()} disabled={loadingDevices}>
+							{loadingDevices ? "Cargando..." : "Refrescar cámaras"}
+						</button>
+					</div>
+
+					<div className="flex gap-2 mb-2">
+						<button className="btn" onClick={startFrontCamera} disabled={streamActive}>
+							Cámara frontal
+						</button>
+						<button className="btn" onClick={startRearCamera} disabled={streamActive}>
+							Cámara trasera (mejor)
 						</button>
 						<button
 							className="btn"
-							onClick={stopCamera}
-							disabled={!streamActive}
+							onClick={() => selectedDeviceId && startCameraWithDevice(selectedDeviceId)}
+							disabled={streamActive || !selectedDeviceId}
 						>
+							Probar cámara seleccionada
+						</button>
+						<button className="btn" onClick={stopCamera} disabled={!streamActive}>
 							Detener cámara
 						</button>
 					</div>
